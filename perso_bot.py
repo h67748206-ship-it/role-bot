@@ -32,9 +32,9 @@ def emoji_valide(code: str, secours: str) -> str:
     return secours
 
 
-EMOJI_COURONNE = emoji_valide("<:couronne:1561382845035974788>", "👑")
-EMOJI_STAFF = emoji_valide("<:staff:1561382969938153655>", "🛠️")
-EMOJI_ABUS = emoji_valide("<:abus:1561383046232670289>", "⚠️")
+EMOJI_COURONNE = emoji_valide("<:Crown:1561379407195545641>", "👑")
+EMOJI_STAFF = emoji_valide("<:1462041546160472095:1561379419178672158>", "🛠️")
+EMOJI_ABUS = emoji_valide("<:lock:1561379416414879777>", "⚠️")
 
 CATEGORIES = {
     "couronne": {
