@@ -1,11 +1,14 @@
-# Fichier unique : bot + mini site web. Lancer : python perso_bot.py
+# Bot ticket + générateur d'embeds (yuu). Lancer : python ticket_bot.py
+import asyncio
+import datetime as dt
+import html as hm
 import os
 import subprocess
 import sys
 
 try:
     import discord
-except ImportError:  # installe discord.py tout seul (pas besoin de requirements.txt)
+except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "discord.py"])
     import discord
 
@@ -13,183 +16,334 @@ from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 
-# ================== CONFIG ==================
-TOKEN = os.getenv("DISCORD_TOKEN") or "COLLE_TON_TOKEN_ICI"
+# ===================== CONFIG =====================
+TOKEN = (os.getenv("DISCORD_TOKEN") or "COLLE_TON_TOKEN_ICI").strip().strip('"').strip("'")
+COULEUR = 0x5865F2
+TICKET_COULEUR = 0x1F4FFF
 
-# Les rôles sont retrouvés par leur NOM (créés automatiquement s'ils n'existent pas)
-ROLES_AFFICHAGE = ["Meow", "Bad boy", "Kiss", "PS"]
-ROLES_NOTIFS = ["Annonce", "Smash or pass", "Giveaway"]
-# ============================================
+# Emojis personnalisés de yuu
+EMOJI_COURONNE = "<:couronne:1561382845035974788>"
+EMOJI_STAFF = "<:staff:1561382969938153655>"
+EMOJI_ABUS = "<:abus:1561383046232670289>"
+
+CATEGORIES = {
+    "couronne": {
+        "label": "Couronne",
+        "emoji": EMOJI_COURONNE,
+        "court": "Demande d'invest, décale, fourni ou hautes demandes",
+        "long": "Demande d'invest, décale, fourni ou hautes demandes.",
+    },
+    "staff": {
+        "label": "Gestion Staff",
+        "emoji": EMOJI_STAFF,
+        "court": "Devenir staff, être rank sur yuu",
+        "long": "Ouvre un ticket pour être rank sur yuu !",
+    },
+    "abus": {
+        "label": "Gestion Abus",
+        "emoji": EMOJI_ABUS,
+        "court": "Abus de perm, abus de plainte, etc.",
+        "long": "Abus de perm, abus de plainte, etc.",
+    },
+}
+
+intents = discord.Intents.default()
+intents.members = True
 
 
-async def get_or_create_role(guild: discord.Guild, name: str) -> discord.Role:
-    role = discord.utils.get(guild.roles, name=name)
-    if role is None:
-        role = await guild.create_role(name=name, reason="Panneau personnalisation")
-    return role
+# ===================== OUTILS =====================
+def emb(titre: str, desc: str = "", couleur: int = COULEUR) -> discord.Embed:
+    return discord.Embed(title=titre, description=desc, color=couleur, timestamp=discord.utils.utcnow())
 
 
-async def appliquer_selection(interaction: discord.Interaction, groupe: list[str], choisis: list[str]):
-    await interaction.response.defer(ephemeral=True)
-    guild, member = interaction.guild, interaction.user
+def ticket_info(ch):
+    """(id_proprio, id_claim ou None) si le salon est un ticket, sinon None."""
+    t = getattr(ch, "topic", None) or ""
+    if not t.startswith("ticket:"):
+        return None
     try:
-        a_ajouter, a_retirer = [], []
-        for nom in groupe:
-            role = await get_or_create_role(guild, nom)
-            if nom in choisis and role not in member.roles:
-                a_ajouter.append(role)
-            elif nom not in choisis and role in member.roles:
-                a_retirer.append(role)
-        if a_ajouter:
-            await member.add_roles(*a_ajouter, reason="Panneau personnalisation")
-        if a_retirer:
-            await member.remove_roles(*a_retirer, reason="Panneau personnalisation")
-    except discord.Forbidden:
-        return await interaction.followup.send(
-            "❌ Je n'ai pas la permission. Mets mon rôle **au-dessus** des rôles du panneau "
-            "et donne-moi « Gérer les rôles ».",
-            ephemeral=True,
-        )
-    if choisis:
-        txt = "✅ Mis à jour : " + ", ".join(f"**{n}**" for n in choisis)
+        d = dict(p.split(":", 1) for p in t.split("|") if ":" in p)
+        owner = int(d["ticket"])
+        claim = int(d["claim"]) if d.get("claim") else None
+    except (ValueError, KeyError):
+        return None
+    return owner, claim
+
+
+def ticket_cat(ch) -> str:
+    t = getattr(ch, "topic", None) or ""
+    d = dict(p.split(":", 1) for p in t.split("|") if ":" in p)
+    return d.get("cat", "autre")
+
+
+def est_staff(inter: discord.Interaction) -> bool:
+    p = inter.user.guild_permissions
+    return p.manage_channels or p.administrator
+
+
+async def refus(inter: discord.Interaction, texte: str):
+    if inter.response.is_done():
+        await inter.followup.send(texte, ephemeral=True)
     else:
-        txt = "🗑️ Tout a été retiré."
-    await interaction.followup.send(txt, ephemeral=True)
+        await inter.response.send_message(texte, ephemeral=True)
 
 
-class SelectGroupe(discord.ui.Select):
-    def __init__(self, groupe, placeholder, custom_id, row):
-        options = [discord.SelectOption(label=n, value=n) for n in groupe]
-        super().__init__(
-            placeholder=placeholder,
-            min_values=0,
-            max_values=len(options),
-            options=options,
-            custom_id=custom_id,
-            row=row,
-        )
-        self.groupe = groupe
-
-    async def callback(self, interaction: discord.Interaction):
-        await appliquer_selection(interaction, self.groupe, self.values)
-
-
-class BoutonToutRetirer(discord.ui.Button):
-    def __init__(self, groupe, custom_id, row):
-        super().__init__(label="Tout retirer", style=discord.ButtonStyle.secondary, custom_id=custom_id, row=row)
-        self.groupe = groupe
-
-    async def callback(self, interaction: discord.Interaction):
-        await appliquer_selection(interaction, self.groupe, [])
-
-
-class PanneauPerso(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)  # persistante
-        self.add_item(SelectGroupe(ROLES_AFFICHAGE, "Choisis tes rôles", "perso:roles:select", 0))
-        self.add_item(BoutonToutRetirer(ROLES_AFFICHAGE, "perso:roles:clear", 1))
-        self.add_item(SelectGroupe(ROLES_NOTIFS, "Choisis tes notifications", "perso:notifs:select", 2))
-        self.add_item(BoutonToutRetirer(ROLES_NOTIFS, "perso:notifs:clear", 3))
-
-
-# ============ MINI SITE WEB (pour Render / cron-job.org) ============
-PAGE = """<!doctype html>
-<html lang="fr"><head>
-<meta charset="utf-8">
+# ===================== MINI SITE WEB =====================
+PANEL_PAGE = """<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{nom}</title>
+<title>Panneau de tickets - __NOM__</title>
 <style>
-  body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-       background:#1e1f22;color:#dbdee1;font-family:system-ui,sans-serif}}
-  .card{{background:#2b2d31;border-radius:14px;padding:28px;max-width:360px;width:90%;text-align:center}}
-  h1{{margin:0 0 6px;font-size:22px;color:#fff}}
-  p{{margin:0 0 18px;color:#b5bac1;font-size:14px}}
-  .row{{display:flex;gap:10px;margin-bottom:18px}}
-  .stat{{flex:1;background:#1e1f22;border-radius:10px;padding:12px}}
-  .stat b{{display:block;font-size:20px;color:#fff}}
-  .stat span{{font-size:12px;color:#949ba4}}
-  .ok{{display:inline-block;padding:4px 12px;border-radius:99px;background:#23a55a33;color:#3ba55d;font-size:13px}}
-</style></head><body>
-<div class="card">
-  <h1>{nom}</h1>
-  <p>Bot de personnalisation : rôles d'affichage et notifications.</p>
-  <div class="row">
-    <div class="stat"><b>{serveurs}</b><span>serveurs</span></div>
-    <div class="stat"><b>{ping} ms</b><span>ping</span></div>
-  </div>
-  <span class="ok">● En ligne</span>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#1e1f22;color:#dbdee1;font-family:system-ui,sans-serif;padding:20px;box-sizing:border-box}
+.embed{background:#2b2d31;border-left:4px solid #1F4FFF;border-radius:6px;padding:16px 18px;
+max-width:520px;width:100%;box-sizing:border-box}
+h1{margin:0 0 10px;font-size:18px;color:#fff}
+.desc{font-size:14px;line-height:1.5;margin-bottom:12px}
+.opt{display:flex;gap:10px;padding:10px 0;border-top:1px solid #3f4147;font-size:14px}
+.opt b{color:#fff}
+.opt p{margin:2px 0 0;color:#b5bac1}
+.menu{margin-top:12px;background:#1e1f22;border-radius:4px;padding:10px 12px;color:#949ba4;font-size:14px}
+.foot{margin-top:14px;font-size:12px;color:#949ba4}
+</style></head><body><div class="embed">
+<h1>Besoin d'aide sur __NOM__ ?</h1>
+<div class="desc">Choisis le motif de ton ticket ci-dessous — un salon privé sera créé pour discuter avec l'équipe.</div>
+__LIGNES__
+<div class="opt"><div><b>🔒 Privé</b><p>visible seulement par toi et le staff</p></div></div>
+<div class="opt"><div><b>⏱️ Réponse</b><p>sous 24h en moyenne</p></div></div>
+<div class="menu">Sélectionne une catégorie... ▾</div>
+<div class="foot">Aperçu du panneau de tickets</div>
 </div></body></html>"""
 
 
-async def page_accueil(request: web.Request):
-    bot = request.app["bot"]
-    html = PAGE.format(
-        nom=bot.user.name if bot.user else "PersoBot",
-        serveurs=len(bot.guilds),
-        ping=round(bot.latency * 1000) if bot.latency == bot.latency else 0,
+async def page_panneau(request: web.Request):
+    b = request.app["bot"]
+    lignes = "".join(
+        f'<div class="opt"><div><b>{hm.escape(v["label"])}</b><p>{hm.escape(v["long"])}</p></div></div>'
+        for v in CATEGORIES.values()
     )
-    return web.Response(text=html, content_type="text/html")
+    nom = hm.escape(b.user.name if b.user else "yuu")
+    page = PANEL_PAGE.replace("__NOM__", nom).replace("__LIGNES__", lignes)
+    return web.Response(text=page, content_type="text/html")
 
 
 async def health(request: web.Request):
     return web.json_response({"status": "ok"})
 
 
-async def lancer_site(bot: commands.Bot):
+async def lancer_site(b: commands.Bot):
     app = web.Application()
-    app["bot"] = bot
-    app.router.add_get("/", page_accueil)
+    app["bot"] = b
+    app.router.add_get("/", page_panneau)
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", 8080))  # Render fournit PORT automatiquement
+    port = int(os.getenv("PORT", 8080))
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"Site web lancé sur le port {port}")
 
 
-intents = discord.Intents.default()
-intents.members = True  # à activer dans le portail développeur (Server Members Intent)
+# ===================== TICKETS =====================
+class RenameModal(discord.ui.Modal, title="Renommer le ticket"):
+    nom = discord.ui.TextInput(label="Nouveau nom", placeholder="ex : problème-paiement", max_length=90)
+
+    async def on_submit(self, inter: discord.Interaction):
+        try:
+            await inter.channel.edit(name=str(self.nom), reason=f"Renommé par {inter.user}")
+        except discord.Forbidden:
+            return await refus(inter, "❌ Il me manque la permission « Gérer les salons ».")
+        await inter.response.send_message(f"✏️ Ticket renommé en **{self.nom}** par {inter.user.mention}.")
 
 
-class PersoBot(commands.Bot):
+async def supprimer_ticket(ch, user):
+    await asyncio.sleep(5)
+    try:
+        await ch.delete(reason=f"Ticket fermé par {user}")
+    except discord.HTTPException:
+        pass
+
+
+class TicketControl(discord.ui.View):
+    def __init__(self, claimed: bool = False):
+        super().__init__(timeout=None)
+        if claimed:
+            self.claim.disabled = True
+            self.claim.label = "Pris en charge"
+
+    @discord.ui.button(label="Claim", emoji=EMOJI_STAFF, style=discord.ButtonStyle.primary, custom_id="ticket:claim")
+    async def claim(self, inter: discord.Interaction, bouton: discord.ui.Button):
+        info = ticket_info(inter.channel)
+        if not info:
+            return await refus(inter, "❌ Ce n'est pas un ticket.")
+        if not est_staff(inter):
+            return await refus(inter, "❌ Réservé au staff.")
+        owner, claim = info
+        if claim:
+            return await refus(inter, f"❌ Déjà pris en charge par <@{claim}>.")
+        await inter.response.edit_message(view=TicketControl(claimed=True))
+        try:
+            await inter.channel.edit(topic=f"ticket:{owner}|claim:{inter.user.id}|cat:{ticket_cat(inter.channel)}")
+        except discord.HTTPException:
+            pass
+        await inter.channel.send(embed=emb("Ticket pris en charge", f"{inter.user.mention} s'occupe de ce ticket.", 0x57F287))
+
+    @discord.ui.button(label="Fermer", emoji=EMOJI_ABUS, style=discord.ButtonStyle.danger, custom_id="ticket:close")
+    async def fermer(self, inter: discord.Interaction, bouton: discord.ui.Button):
+        ch = inter.channel
+        info = ticket_info(ch)
+        if not info:
+            return await refus(inter, "❌ Ce n'est pas un ticket.")
+        if not (info[0] == inter.user.id or est_staff(inter)):
+            return await refus(inter, "❌ Tu ne peux pas fermer ce ticket.")
+        await inter.response.send_message("🔒 Ticket fermé, suppression dans 5 secondes…")
+        asyncio.create_task(supprimer_ticket(ch, inter.user))
+
+    @discord.ui.button(label="Renommer", emoji=EMOJI_COURONNE, style=discord.ButtonStyle.secondary, custom_id="ticket:rename")
+    async def renommer(self, inter: discord.Interaction, bouton: discord.ui.Button):
+        if not ticket_info(inter.channel):
+            return await refus(inter, "❌ Ce n'est pas un ticket.")
+        if not est_staff(inter):
+            return await refus(inter, "❌ Réservé au staff.")
+        await inter.response.send_modal(RenameModal())
+
+
+class TicketPanel(discord.ui.View):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(timeout=None)
+
+    @discord.ui.select(
+        placeholder="Sélectionne une catégorie...",
+        custom_id="ticket:panel",
+        options=[
+            discord.SelectOption(label=v["label"], value=k, emoji=v["emoji"], description=v["court"])
+            for k, v in CATEGORIES.items()
+        ],
+    )
+    async def choisir(self, inter: discord.Interaction, select: discord.ui.Select):
+        key = select.values[0]
+        cat = CATEGORIES[key]
+        guild, user = inter.guild, inter.user
+
+        for ch in guild.text_channels:
+            info = ticket_info(ch)
+            if info and info[0] == user.id:
+                return await refus(inter, f"Tu as déjà un ticket ouvert : {ch.mention}")
+
+        ow = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, attach_files=True, read_message_history=True
+            ),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        }
+        await inter.response.defer(ephemeral=True)
+        try:
+            ch = await guild.create_text_channel(
+                name=f"{key}-{user.name}"[:90],
+                category=inter.channel.category,
+                overwrites=ow,
+                topic=f"ticket:{user.id}|cat:{key}",
+                reason=f"Ticket {cat['label']} de {user}",
+            )
+        except discord.Forbidden:
+            return await refus(inter, "❌ Il me manque la permission « Gérer les salons ».")
+
+        e = discord.Embed(
+            title=f"{cat['emoji']} {cat['label']} — {user.display_name}",
+            description="Merci d'avoir contacté le support.\nDécris ton problème puis attends qu'un membre de l'équipe te réponde.",
+            color=TICKET_COULEUR,
+        )
+        e.set_thumbnail(url=user.display_avatar.url)
+        await ch.send(content=user.mention, embed=e, view=TicketControl())
+        await inter.followup.send(f"✅ Ticket créé : {ch.mention}", ephemeral=True)
+
+
+# ===================== BOT =====================
+class TicketBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
 
     async def setup_hook(self):
-        self.add_view(PanneauPerso())  # les anciens panneaux restent fonctionnels
+        self.add_view(TicketPanel())
+        self.add_view(TicketControl())
         await self.tree.sync()
-        await lancer_site(self)  # mini site web pour Render
+        await lancer_site(self)
 
 
-bot = PersoBot()
+bot = TicketBot()
 
 
-@bot.event
-async def on_ready():
-    print(f"Connecté en tant que {bot.user} ({bot.user.id})")
-
-
-@bot.tree.command(name="panneau-perso", description="Envoie le panneau de personnalisation")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.guild_only()
-async def panneau_perso(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Personnalisation",
-        description="Configure ton profil et tes notifications ci-dessous.",
-        color=discord.Color.from_rgb(54, 57, 63),
-    )
-    embed.add_field(name="Rôles d'affichage", value="Choisis un ou plusieurs rôles pour ton profil.", inline=False)
-    embed.add_field(name="Notifications", value="Choisis les alertes que tu veux recevoir.", inline=False)
-    await interaction.channel.send(embed=embed, view=PanneauPerso())
-    await interaction.response.send_message("✅ Panneau envoyé.", ephemeral=True)
-
-
-@panneau_perso.error
-async def panneau_perso_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+@bot.tree.error
+async def on_app_error(inter: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Réservé aux admins.", ephemeral=True)
-    else:
-        raise error
+        return await refus(inter, "❌ Tu n'as pas la permission pour ça.")
+    print(f"Erreur commande : {error!r}")
+    await refus(inter, "❌ Une erreur est survenue.")
 
 
-bot.run(TOKEN)
+# ===================== COMMANDES =====================
+@bot.tree.command(name="ticketpanel", description="Envoyer le panneau de tickets dans ce salon")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def ticketpanel(inter: discord.Interaction):
+    if not inter.user.guild_permissions.manage_guild:
+        return await refus(inter, "❌ Tu n'as pas la permission pour ça.")
+    lignes = "\n\n".join(f"{v['emoji']} **{v['label']}** — {v['long']}" for v in CATEGORIES.values())
+    e = discord.Embed(
+        title=f"Besoin d'aide sur {inter.guild.name} ?",
+        description=(
+            "Choisis le motif de ton ticket ci-dessous — un salon privé sera créé pour discuter avec l'équipe.\n\n"
+            + lignes
+            + "\n\n🔒 **Privé** — visible seulement par toi et le staff\n⏱️ **Réponse** sous 24h en moyenne"
+        ),
+        color=TICKET_COULEUR,
+    )
+    if inter.guild.icon:
+        e.set_thumbnail(url=inter.guild.icon.url)
+    await inter.channel.send(embed=e, view=TicketPanel())
+    await inter.response.send_message("✅ Panneau envoyé.", ephemeral=True)
+
+
+@bot.tree.command(name="embed", description="Créer un embed personnalisé")
+@app_commands.describe(
+    titre="Titre de l'embed",
+    description="Texte de l'embed (\\n pour un saut de ligne)",
+    couleur="Couleur hexadécimale, ex : 5865F2",
+    image="Lien d'une image (optionnel)",
+    miniature="Lien d'une miniature (optionnel)",
+    footer="Texte du bas (optionnel)",
+)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.guild_only()
+async def embed_cmd(
+    inter: discord.Interaction,
+    titre: str,
+    description: str,
+    couleur: str = "5865F2",
+    image: str = None,
+    miniature: str = None,
+    footer: str = None,
+):
+    if not inter.user.guild_permissions.manage_messages:
+        return await refus(inter, "❌ Tu n'as pas la permission pour ça.")
+    try:
+        c = int(couleur.strip().lstrip("#"), 16)
+    except ValueError:
+        return await refus(inter, "❌ Couleur invalide (ex : 5865F2).")
+    e = discord.Embed(title=titre, description=description.replace("\\n", "\n"), color=c)
+    if image:
+        e.set_image(url=image)
+    if miniature:
+        e.set_thumbnail(url=miniature)
+    if footer:
+        e.set_footer(text=footer)
+    await inter.channel.send(embed=e)
+    await inter.response.send_message("✅ Embed envoyé.", ephemeral=True)
+
+
+# ===================== LANCEMENT =====================
+if __name__ == "__main__":
+    if TOKEN == "COLLE_TON_TOKEN_ICI":
+        print("ERREUR : mets ton token dans DISCORD_TOKEN ou dans le script.")
+        sys.exit(1)
+    bot.run(TOKEN)
